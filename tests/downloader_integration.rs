@@ -64,6 +64,7 @@ async fn fetches_successful_article_via_single_server() {
         article_timeout: Duration::from_secs(10),
         work_channel_capacity: 64,
         outcome_channel_capacity: 64,
+        probe_policy: None,
     };
     let (handle, outcomes) = spawn_downloader(config);
 
@@ -132,6 +133,7 @@ async fn falls_over_to_backup_when_primary_returns_430() {
         article_timeout: Duration::from_secs(10),
         work_channel_capacity: 64,
         outcome_channel_capacity: 64,
+        probe_policy: None,
     };
     let (handle, outcomes) = spawn_downloader(config);
 
@@ -195,6 +197,7 @@ async fn multiple_articles_dispatch_concurrently() {
         article_timeout: Duration::from_secs(10),
         work_channel_capacity: 64,
         outcome_channel_capacity: 64,
+        probe_policy: None,
     };
     let (handle, outcomes) = spawn_downloader(config);
 
@@ -265,6 +268,7 @@ async fn back_pressure_halts_driver_when_outcomes_are_not_drained() {
         article_timeout: Duration::from_secs(10),
         work_channel_capacity: 64,
         outcome_channel_capacity: 1, // force back-pressure
+        probe_policy: None,
     };
     let (handle, mut outcomes) = spawn_downloader(config);
 
@@ -340,6 +344,7 @@ async fn gives_up_after_retries_across_servers_all_fail() {
         article_timeout: Duration::from_secs(10),
         work_channel_capacity: 64,
         outcome_channel_capacity: 64,
+        probe_policy: None,
     };
     let (handle, outcomes) = spawn_downloader(config);
 

@@ -439,6 +439,7 @@ pub fn spawn_downloader(
 // Scheduler loop — routes pending articles to server queues and consumes
 // wrapper-worker results.
 // ---------------------------------------------------------------------------
+#[allow(clippy::too_many_arguments)]
 async fn scheduler_loop(
     servers: Vec<Arc<Server>>,
     server_queues: Vec<Arc<ServerQueue>>,
@@ -594,6 +595,7 @@ async fn scheduler_loop(
     info!("downloader scheduler exiting");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_pending(
     servers: &[Arc<Server>],
     server_queues: &[Arc<ServerQueue>],
@@ -631,32 +633,32 @@ async fn dispatch_pending(
                 // Probe gate: for cascade articles (already tried ≥ 1 server) sample
                 // a small batch before committing the full backlog to the backup server.
                 let mut is_probe = false;
-                if let Some(policy) = probe_policy {
-                    if !pending[i].article.try_list().is_empty() {
-                        let key = (pending[i].article.job_id.clone(), target.id().to_string());
-                        let state = probe_tracker.entry(key).or_insert_with(ProbeState::new);
-                        match state.status {
-                            ProbeStatus::Rejected => {
-                                // Pre-mark this server as tried so select_server routes
-                                // to the next tier on the very next loop iteration.
-                                pending[i].article.mark_server_tried(target.id());
-                                // Don't increment i — re-dispatch with updated try_list.
+                if let Some(policy) = probe_policy
+                    && !pending[i].article.try_list().is_empty()
+                {
+                    let key = (pending[i].article.job_id.clone(), target.id().to_string());
+                    let state = probe_tracker.entry(key).or_insert_with(ProbeState::new);
+                    match state.status {
+                        ProbeStatus::Rejected => {
+                            // Pre-mark this server as tried so select_server routes
+                            // to the next tier on the very next loop iteration.
+                            pending[i].article.mark_server_tried(target.id());
+                            // Don't increment i — re-dispatch with updated try_list.
+                            continue;
+                        }
+                        ProbeStatus::Approved => {
+                            // Server proved useful for this job; fall through.
+                        }
+                        ProbeStatus::Probing => {
+                            if state.probes_sent < policy.probe_count {
+                                state.probes_sent += 1;
+                                is_probe = true;
+                            } else {
+                                // All probes dispatched; waiting for results before
+                                // routing the remaining backlog.
+                                bump_retry(next_dispatch_retry, Duration::from_millis(50));
+                                i += 1;
                                 continue;
-                            }
-                            ProbeStatus::Approved => {
-                                // Server proved useful for this job; fall through.
-                            }
-                            ProbeStatus::Probing => {
-                                if state.probes_sent < policy.probe_count {
-                                    state.probes_sent += 1;
-                                    is_probe = true;
-                                } else {
-                                    // All probes dispatched; waiting for results before
-                                    // routing the remaining backlog.
-                                    bump_retry(next_dispatch_retry, Duration::from_millis(50));
-                                    i += 1;
-                                    continue;
-                                }
                             }
                         }
                     }
