@@ -824,6 +824,18 @@ async fn fetch_batch_pipelined(
         pipeline.submit(item.article.message_id.clone(), idx as u64);
     }
 
+    // Per-batch timing. Emitted at debug so operators running at info
+    // aren't flooded with per-fetch noise; flip with `RUST_LOG=nzb_news=debug`
+    // (or finer-grained `nzb_news::downloader=debug`) when diagnosing
+    // throughput or cascade-latency issues.
+    let batch_start = std::time::Instant::now();
+    debug!(
+        server = %server.id(),
+        wrapper_id = wrapper.id,
+        batch_size = batch.len(),
+        pipeline_depth = depth,
+        "batch_start"
+    );
     let outcome = tokio::time::timeout(batch_timeout, async {
         let conn = wrapper
             .conn_mut()
@@ -831,6 +843,14 @@ async fn fetch_batch_pipelined(
         pipeline.process_all(conn).await
     })
     .await;
+    let batch_ms = batch_start.elapsed().as_millis() as u64;
+    debug!(
+        server = %server.id(),
+        wrapper_id = wrapper.id,
+        batch_size = batch.len(),
+        batch_ms,
+        "batch_done"
+    );
 
     let per_item = match outcome {
         Ok(Ok(results)) => results,
