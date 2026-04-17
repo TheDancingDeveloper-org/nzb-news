@@ -237,6 +237,24 @@ impl ServerQueue {
         q.drain(..).collect()
     }
 
+    /// Remove items matching `job_id` and return them to the caller. Used
+    /// by `PurgeJob` so a cancelled/aborted job's queued-but-not-yet-fetched
+    /// articles don't continue consuming connection slots that healthy jobs
+    /// could be using.
+    async fn drain_job(&self, job_id: &str) -> Vec<WorkItem> {
+        let mut q = self.deque.lock().await;
+        let mut removed = Vec::new();
+        q.retain(|item| {
+            if item.article.job_id == job_id {
+                removed.push(item.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
     fn note_completed(&self, n: usize) {
         self.inflight.fetch_sub(n, Ordering::Relaxed);
     }
@@ -267,6 +285,26 @@ enum SchedulerMsg {
         server: Arc<Server>,
         error: String,
     },
+}
+
+/// Out-of-band commands from the caller (distinct from worker-result
+/// traffic on `SchedulerMsg`). Kept on a separate channel so the
+/// scheduler can still use "all wrapper-worker senders dropped" to
+/// detect pool shutdown — the control sender lives on the public
+/// `DownloaderHandle`, independent of the worker fleet.
+#[allow(clippy::enum_variant_names)] // the "Job" suffix reads naturally for each variant
+enum ControlMsg {
+    /// Pause dispatching for a job. Articles for `job_id` stay in the
+    /// scheduler's pending list but are not routed to any server queue
+    /// until a matching `ResumeJob` arrives. Articles already handed to
+    /// a worker (in `server_queues[idx]` or mid-fetch) complete normally.
+    PauseJob { job_id: String },
+    /// Reverse of `PauseJob` — resume normal dispatching for this job.
+    ResumeJob { job_id: String },
+    /// Drop all scheduler-level state for a job: remove pending articles,
+    /// clear probe state, forget paused state. Used on cancel/abort so
+    /// nothing continues to route after the caller has given up.
+    PurgeJob { job_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +359,7 @@ impl ProbeState {
 
 pub struct DownloaderHandle {
     work_tx: mpsc::Sender<WorkItem>,
+    control_tx: mpsc::Sender<ControlMsg>,
     shutdown: Arc<Notify>,
     driver_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -336,6 +375,32 @@ impl DownloaderHandle {
 
     pub fn sender(&self) -> mpsc::Sender<WorkItem> {
         self.work_tx.clone()
+    }
+
+    /// Pause dispatching for `job_id`. Articles stay in the scheduler's
+    /// pending list. In-flight fetches complete normally; the change is
+    /// observable within ~tens of ms. Idempotent — safe to call repeatedly.
+    pub fn pause_job(&self, job_id: &str) {
+        let _ = self.control_tx.try_send(ControlMsg::PauseJob {
+            job_id: job_id.to_string(),
+        });
+    }
+
+    /// Reverse of [`pause_job`]. Idempotent — calling on a non-paused job
+    /// is a no-op.
+    pub fn resume_job(&self, job_id: &str) {
+        let _ = self.control_tx.try_send(ControlMsg::ResumeJob {
+            job_id: job_id.to_string(),
+        });
+    }
+
+    /// Drop all scheduler-level state for this job: remove pending articles,
+    /// clear probe state, drop the pause flag. Used on cancel/abort so work
+    /// already accepted into nzb-news stops flowing.
+    pub fn purge_job(&self, job_id: &str) {
+        let _ = self.control_tx.try_send(ControlMsg::PurgeJob {
+            job_id: job_id.to_string(),
+        });
     }
 
     pub fn shutdown(&self) {
@@ -380,6 +445,9 @@ pub fn spawn_downloader(
 
     let (scheduler_tx, scheduler_rx) =
         mpsc::channel::<SchedulerMsg>(config.work_channel_capacity.max(1));
+    // Control channel — user-facing pause/resume/purge. Small buffer: these
+    // are infrequent (API-driven) and should never back up.
+    let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(64);
 
     // Spawn wrapper worker tasks. Each owns one NewsWrapper for its
     // lifetime; the Server's idle/busy sets aren't used by this path
@@ -419,6 +487,7 @@ pub fn spawn_downloader(
         server_queues,
         work_rx,
         scheduler_rx,
+        control_rx,
         outcome_tx,
         scheduler_shutdown,
         worker_handles,
@@ -428,6 +497,7 @@ pub fn spawn_downloader(
     (
         DownloaderHandle {
             work_tx,
+            control_tx,
             shutdown,
             driver_task: Some(task),
         },
@@ -445,6 +515,7 @@ async fn scheduler_loop(
     server_queues: Vec<Arc<ServerQueue>>,
     mut work_rx: mpsc::Receiver<WorkItem>,
     mut scheduler_rx: mpsc::Receiver<SchedulerMsg>,
+    mut control_rx: mpsc::Receiver<ControlMsg>,
     outcome_tx: mpsc::Sender<FetchOutcome>,
     shutdown: Arc<Notify>,
     worker_handles: Vec<tokio::task::JoinHandle<()>>,
@@ -463,6 +534,10 @@ async fn scheduler_loop(
     let mut probe_tracker: HashMap<(String, String), ProbeState> = HashMap::new();
     // Tags of in-flight probe articles.
     let mut probe_tags: HashSet<WorkTag> = HashSet::new();
+    // Jobs for which dispatch is paused. Articles for these job_ids stay
+    // in `pending` but aren't routed to any server queue. Articles already
+    // handed off (in `server_queues[idx]` or mid-fetch) complete normally.
+    let mut paused_jobs: HashSet<String> = HashSet::new();
 
     // Rough soft cap on per-server queue depth: (connections × pipelining × 2).
     // Prevents one server's queue from absorbing all pending work when
@@ -487,6 +562,7 @@ async fn scheduler_loop(
             probe_policy.as_ref(),
             &mut probe_tracker,
             &mut probe_tags,
+            &paused_jobs,
         )
         .await;
 
@@ -543,6 +619,74 @@ async fn scheduler_loop(
                     None => {
                         // All wrapper workers have exited.
                         break;
+                    }
+                }
+            }
+
+            maybe_ctrl = control_rx.recv() => {
+                match maybe_ctrl {
+                    Some(ControlMsg::PauseJob { job_id }) => {
+                        if paused_jobs.insert(job_id.clone()) {
+                            debug!(job_id = %job_id, "scheduler: pause");
+                        }
+                    }
+                    Some(ControlMsg::ResumeJob { job_id }) => {
+                        if paused_jobs.remove(&job_id) {
+                            debug!(job_id = %job_id, "scheduler: resume");
+                            // Articles for this job sat idle in `pending`;
+                            // clear any retry backoff so they route on the
+                            // next iteration.
+                            next_dispatch_retry = None;
+                        }
+                    }
+                    Some(ControlMsg::PurgeJob { job_id }) => {
+                        // Remove pending articles for the job and emit
+                        // Cancelled outcomes so upstream accounting closes
+                        // them out. Also clear any probe state / pause flag
+                        // tied to this job, and rip items out of each
+                        // server queue so wrapper workers don't keep
+                        // fetching ghost articles that would consume slots
+                        // healthy jobs could use.
+                        let before = pending.len();
+                        let mut kept: Vec<WorkItem> = Vec::with_capacity(pending.len());
+                        for item in pending.drain(..) {
+                            if item.article.job_id == job_id {
+                                let _ = outcome_tx
+                                    .send(FetchOutcome::Cancelled { tag: item.tag })
+                                    .await;
+                            } else {
+                                kept.push(item);
+                            }
+                        }
+                        pending = kept;
+                        let mut q_drained = 0usize;
+                        for q in &server_queues {
+                            let items = q.drain_job(&job_id).await;
+                            q_drained += items.len();
+                            for it in items {
+                                let _ = outcome_tx
+                                    .send(FetchOutcome::Cancelled { tag: it.tag })
+                                    .await;
+                            }
+                        }
+                        probe_tracker.retain(|(j, _), _| j != &job_id);
+                        probe_tags.retain(|_tag| {
+                            // Probe tags don't carry job_id directly; leave
+                            // them — they'll be resolved to Cancelled/ignored
+                            // on outcome by the dispatcher.
+                            true
+                        });
+                        paused_jobs.remove(&job_id);
+                        debug!(
+                            job_id = %job_id,
+                            purged_pending = before - pending.len(),
+                            purged_queues = q_drained,
+                            "scheduler: purge"
+                        );
+                    }
+                    None => {
+                        // Handle dropped — shouldn't happen while the
+                        // downloader is running, but tolerate it.
                     }
                 }
             }
@@ -606,6 +750,7 @@ async fn dispatch_pending(
     probe_policy: Option<&ServerProbePolicy>,
     probe_tracker: &mut HashMap<(String, String), ProbeState>,
     probe_tags: &mut HashSet<WorkTag>,
+    paused_jobs: &HashSet<String>,
 ) {
     // First pass: group items by target-server index. Items that select
     // another selection path (WaitRampup, CascadeReset, GiveUp) are
@@ -616,6 +761,15 @@ async fn dispatch_pending(
 
     let mut i = 0;
     while i < pending.len() {
+        // Pause gate: leave paused-job articles in pending without routing.
+        // `i += 1` here (not `continue` without increment) because the item
+        // itself isn't changing — only a control command can unpause it,
+        // and that command bumps the scheduler loop, causing a re-entry
+        // that will visit the article again.
+        if !paused_jobs.is_empty() && paused_jobs.contains(&pending[i].article.job_id) {
+            i += 1;
+            continue;
+        }
         let sel = {
             let item = &pending[i];
             select_server(&item.article, &item.file, &item.job, servers)
@@ -747,12 +901,26 @@ fn update_probe_on_result(
         if success {
             state.probes_hit += 1;
         }
-        if state.probes_returned >= state.probes_sent && state.status == ProbeStatus::Probing {
+        // Only evaluate once the full probe batch has returned. Evaluating
+        // earlier (e.g. the moment `returned == sent` while more are still
+        // to be dispatched) rejects a server off a single missed probe —
+        // the bug that shipped in 0.1.4.
+        //
+        // Also evaluate if the server got fewer than `probe_count` probes
+        // total because the pending queue ran dry (all articles for this
+        // key already dispatched). Without this, the server would stay
+        // in `Probing` forever and any future cascade article to it would
+        // stall in the `waiting for results` branch of `dispatch_pending`.
+        let batch_complete = state.probes_returned >= policy.probe_count
+            || (state.probes_returned >= state.probes_sent
+                && state.probes_sent >= policy.probe_count);
+        if batch_complete && state.status == ProbeStatus::Probing {
             state.evaluate(policy);
             info!(
                 job_id,
                 server_id,
                 probes_sent = state.probes_sent,
+                probes_returned = state.probes_returned,
                 probes_hit = state.probes_hit,
                 approved = matches!(state.status, ProbeStatus::Approved),
                 "server probe evaluated"
