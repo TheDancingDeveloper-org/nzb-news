@@ -430,12 +430,19 @@ async fn scheduler_loop(
 
             maybe_msg = scheduler_rx.recv() => {
                 match maybe_msg {
-                    Some(msg) => handle_scheduler_msg(
-                        msg,
-                        &servers,
-                        &mut pending,
-                        &outcome_tx,
-                    ).await,
+                    Some(msg) => {
+                        handle_scheduler_msg(msg, &servers, &mut pending, &outcome_tx).await;
+                        // Drain burst: wrappers now emit one FetchResult
+                        // per article response (streaming), so a batch of
+                        // N in-flight articles produces N scheduler msgs in
+                        // quick succession. Without draining, dispatch_pending
+                        // (O(pending × servers)) would run once per message.
+                        // Consuming the whole burst here means one O(N) pass
+                        // serves all of them.
+                        while let Ok(extra) = scheduler_rx.try_recv() {
+                            handle_scheduler_msg(extra, &servers, &mut pending, &outcome_tx).await;
+                        }
+                    }
                     None => {
                         // All wrapper workers have exited.
                         break;
