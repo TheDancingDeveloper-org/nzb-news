@@ -44,5 +44,5 @@ pub mod trylist;
 
 pub use article::{Article, NzbFile, NzbObject};
 pub use downloader::{
-    DownloaderConfig, DownloaderHandle, FetchOutcome, WorkItem, spawn_downloader,
+    DownloaderConfig, DownloaderHandle, FetchOutcome, ServerProbePolicy, WorkItem, spawn_downloader,
 };

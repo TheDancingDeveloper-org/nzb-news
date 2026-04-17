@@ -21,7 +21,7 @@
 //! throughput: the pipeline-fill effectively masks per-article RTT across
 //! every connection simultaneously.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -86,6 +86,40 @@ pub enum FetchOutcome {
     Cancelled { tag: WorkTag },
 }
 
+/// Policy for probing backup servers before committing all missing articles
+/// to them.
+///
+/// When an article cascades past the highest-priority server, the dispatcher
+/// sends a small sample of missing articles as "probes" to the next-priority
+/// server instead of immediately routing the full backlog. Only if the probe
+/// hit-rate meets the threshold is the server approved for all remaining
+/// cascade articles. If not, the server is rejected for this job and remaining
+/// articles cascade further or fail fast.
+///
+/// This avoids the O(N × servers) cascade cost for fail-heavy NZBs where
+/// backup servers are equally unhelpful (e.g. DMCA-removed or out-of-retention
+/// content that no provider carries).
+#[derive(Clone, Debug)]
+pub struct ServerProbePolicy {
+    /// How many articles to probe before deciding whether a backup server is
+    /// useful for this job. Default: `10`.
+    pub probe_count: u32,
+    /// Minimum percentage (0–100) of probed articles that must succeed for
+    /// the server to be approved. If the hit-rate falls below this, the server
+    /// is rejected for this job and the remaining cascade articles skip it.
+    /// Default: `10.0` (at least 1 out of every 10 probes must succeed).
+    pub min_hit_rate_pct: f32,
+}
+
+impl Default for ServerProbePolicy {
+    fn default() -> Self {
+        Self {
+            probe_count: 10,
+            min_hit_rate_pct: 10.0,
+        }
+    }
+}
+
 /// Configuration for a new downloader.
 #[derive(Clone)]
 pub struct DownloaderConfig {
@@ -107,6 +141,10 @@ pub struct DownloaderConfig {
     /// assembler is slower than the driver, the channel fills and
     /// `outcome_tx.send().await` blocks the scheduler.
     pub outcome_channel_capacity: usize,
+    /// Optional backup-server probe policy. `None` disables probing and
+    /// all missing articles cascade to every server unconditionally.
+    /// Defaults to `Some(ServerProbePolicy::default())`.
+    pub probe_policy: Option<ServerProbePolicy>,
 }
 
 impl DownloaderConfig {
@@ -119,6 +157,7 @@ impl DownloaderConfig {
             article_timeout: Duration::from_secs(60),
             work_channel_capacity: 4096,
             outcome_channel_capacity: 4096,
+            probe_policy: Some(ServerProbePolicy::default()),
         }
     }
 }
@@ -231,6 +270,52 @@ enum SchedulerMsg {
 }
 
 // ---------------------------------------------------------------------------
+// Server-probe tracking — lives inside the scheduler task only.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq)]
+enum ProbeStatus {
+    /// Probes are still in flight (sent < probe_count, or waiting for returns).
+    Probing,
+    /// Hit-rate met the threshold — server approved for remaining cascade work.
+    Approved,
+    /// Hit-rate missed the threshold — server skipped for this job.
+    Rejected,
+}
+
+#[derive(Debug)]
+struct ProbeState {
+    probes_sent: u32,
+    probes_returned: u32,
+    probes_hit: u32,
+    status: ProbeStatus,
+}
+
+impl ProbeState {
+    fn new() -> Self {
+        Self {
+            probes_sent: 0,
+            probes_returned: 0,
+            probes_hit: 0,
+            status: ProbeStatus::Probing,
+        }
+    }
+
+    fn evaluate(&mut self, policy: &ServerProbePolicy) {
+        let rate = if self.probes_sent == 0 {
+            0.0
+        } else {
+            self.probes_hit as f32 / self.probes_sent as f32 * 100.0
+        };
+        self.status = if rate >= policy.min_hit_rate_pct {
+            ProbeStatus::Approved
+        } else {
+            ProbeStatus::Rejected
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DownloaderHandle
 // ---------------------------------------------------------------------------
 
@@ -272,6 +357,7 @@ pub fn spawn_downloader(
     let (outcome_tx, outcome_rx) =
         mpsc::channel::<FetchOutcome>(config.outcome_channel_capacity.max(1));
     let shutdown = Arc::new(Notify::new());
+    let probe_policy = config.probe_policy;
 
     // Build Server objects sorted by priority.
     let mut servers: Vec<Arc<Server>> = config
@@ -336,6 +422,7 @@ pub fn spawn_downloader(
         outcome_tx,
         scheduler_shutdown,
         worker_handles,
+        probe_policy,
     ));
 
     (
@@ -360,6 +447,7 @@ async fn scheduler_loop(
     outcome_tx: mpsc::Sender<FetchOutcome>,
     shutdown: Arc<Notify>,
     worker_handles: Vec<tokio::task::JoinHandle<()>>,
+    probe_policy: Option<ServerProbePolicy>,
 ) {
     info!(
         servers = servers.len(),
@@ -369,6 +457,11 @@ async fn scheduler_loop(
 
     let mut pending: Vec<WorkItem> = Vec::new();
     let mut next_dispatch_retry: Option<tokio::time::Instant> = None;
+
+    // Per-(job, server) probe state. Keyed by (job_id, server_id).
+    let mut probe_tracker: HashMap<(String, String), ProbeState> = HashMap::new();
+    // Tags of in-flight probe articles.
+    let mut probe_tags: HashSet<WorkTag> = HashSet::new();
 
     // Rough soft cap on per-server queue depth: (connections × pipelining × 2).
     // Prevents one server's queue from absorbing all pending work when
@@ -390,6 +483,9 @@ async fn scheduler_loop(
             &mut pending,
             &mut next_dispatch_retry,
             &outcome_tx,
+            probe_policy.as_ref(),
+            &mut probe_tracker,
+            &mut probe_tags,
         )
         .await;
 
@@ -431,7 +527,7 @@ async fn scheduler_loop(
             maybe_msg = scheduler_rx.recv() => {
                 match maybe_msg {
                     Some(msg) => {
-                        handle_scheduler_msg(msg, &servers, &mut pending, &outcome_tx).await;
+                        handle_scheduler_msg(msg, &servers, &mut pending, &outcome_tx, probe_policy.as_ref(), &mut probe_tracker, &mut probe_tags).await;
                         // Drain burst: wrappers now emit one FetchResult
                         // per article response (streaming), so a batch of
                         // N in-flight articles produces N scheduler msgs in
@@ -440,7 +536,7 @@ async fn scheduler_loop(
                         // Consuming the whole burst here means one O(N) pass
                         // serves all of them.
                         while let Ok(extra) = scheduler_rx.try_recv() {
-                            handle_scheduler_msg(extra, &servers, &mut pending, &outcome_tx).await;
+                            handle_scheduler_msg(extra, &servers, &mut pending, &outcome_tx, probe_policy.as_ref(), &mut probe_tracker, &mut probe_tags).await;
                         }
                     }
                     None => {
@@ -478,7 +574,7 @@ async fn scheduler_loop(
     // Drain any remaining scheduler_rx messages so workers exiting after
     // the close signal can still emit their final results.
     while let Some(msg) = scheduler_rx.recv().await {
-        handle_scheduler_msg(msg, &servers, &mut Vec::new(), &outcome_tx).await;
+        handle_scheduler_msg(msg, &servers, &mut Vec::new(), &outcome_tx, probe_policy.as_ref(), &mut probe_tracker, &mut probe_tags).await;
     }
 
     // Wait for every wrapper worker to exit.
@@ -496,6 +592,9 @@ async fn dispatch_pending(
     pending: &mut Vec<WorkItem>,
     next_dispatch_retry: &mut Option<tokio::time::Instant>,
     outcome_tx: &mpsc::Sender<FetchOutcome>,
+    probe_policy: Option<&ServerProbePolicy>,
+    probe_tracker: &mut HashMap<(String, String), ProbeState>,
+    probe_tags: &mut HashSet<WorkTag>,
 ) {
     // First pass: group items by target-server index. Items that select
     // another selection path (WaitRampup, CascadeReset, GiveUp) are
@@ -519,6 +618,44 @@ async fn dispatch_pending(
                         continue;
                     }
                 };
+
+                // Probe gate: for cascade articles (already tried ≥ 1 server) sample
+                // a small batch before committing the full backlog to the backup server.
+                let mut is_probe = false;
+                if let Some(policy) = probe_policy {
+                    if !pending[i].article.try_list().is_empty() {
+                        let key = (
+                            pending[i].article.job_id.clone(),
+                            target.id().to_string(),
+                        );
+                        let state = probe_tracker.entry(key).or_insert_with(ProbeState::new);
+                        match state.status {
+                            ProbeStatus::Rejected => {
+                                // Pre-mark this server as tried so select_server routes
+                                // to the next tier on the very next loop iteration.
+                                pending[i].article.mark_server_tried(target.id());
+                                // Don't increment i — re-dispatch with updated try_list.
+                                continue;
+                            }
+                            ProbeStatus::Approved => {
+                                // Server proved useful for this job; fall through.
+                            }
+                            ProbeStatus::Probing => {
+                                if state.probes_sent < policy.probe_count {
+                                    state.probes_sent += 1;
+                                    is_probe = true;
+                                } else {
+                                    // All probes dispatched; waiting for results before
+                                    // routing the remaining backlog.
+                                    bump_retry(next_dispatch_retry, Duration::from_millis(50));
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let q = &server_queues[idx];
                 // Cap: check depth + items we're about to push this pass.
                 if q.depth() + per_server[idx].len() >= per_server_cap[idx] {
@@ -528,6 +665,9 @@ async fn dispatch_pending(
                 }
                 let item = pending.swap_remove(i);
                 item.article.set_fetcher_priority(target.priority());
+                if is_probe {
+                    probe_tags.insert(item.tag);
+                }
                 per_server[idx].push(item);
             }
             Selection::WaitRampup(d) => {
@@ -576,6 +716,44 @@ fn bump_retry(slot: &mut Option<tokio::time::Instant>, d: Duration) {
 }
 
 // ---------------------------------------------------------------------------
+// Probe result accounting.
+// ---------------------------------------------------------------------------
+
+/// Called for every article result (success or error). If the article was
+/// a probe, update the probe state and evaluate once all probes have returned.
+fn update_probe_on_result(
+    tag: WorkTag,
+    job_id: &str,
+    server_id: &str,
+    success: bool,
+    probe_tags: &mut HashSet<WorkTag>,
+    probe_tracker: &mut HashMap<(String, String), ProbeState>,
+    policy: &ServerProbePolicy,
+) {
+    if !probe_tags.remove(&tag) {
+        return; // not a probe article
+    }
+    let key = (job_id.to_string(), server_id.to_string());
+    if let Some(state) = probe_tracker.get_mut(&key) {
+        state.probes_returned += 1;
+        if success {
+            state.probes_hit += 1;
+        }
+        if state.probes_returned >= state.probes_sent && state.status == ProbeStatus::Probing {
+            state.evaluate(policy);
+            info!(
+                job_id,
+                server_id,
+                probes_sent = state.probes_sent,
+                probes_hit = state.probes_hit,
+                approved = matches!(state.status, ProbeStatus::Approved),
+                "server probe evaluated"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SchedulerMsg dispatch.
 // ---------------------------------------------------------------------------
 async fn handle_scheduler_msg(
@@ -583,6 +761,9 @@ async fn handle_scheduler_msg(
     servers: &[Arc<Server>],
     pending: &mut Vec<WorkItem>,
     outcome_tx: &mpsc::Sender<FetchOutcome>,
+    probe_policy: Option<&ServerProbePolicy>,
+    probe_tracker: &mut HashMap<(String, String), ProbeState>,
+    probe_tags: &mut HashSet<WorkTag>,
 ) {
     match msg {
         SchedulerMsg::FetchResult {
@@ -595,6 +776,17 @@ async fn handle_scheduler_msg(
                     let article_bytes = bytes.len() as u64;
                     item.job.record_article_downloaded(article_bytes);
                     item.file.mark_article_completed();
+                    if let Some(policy) = probe_policy {
+                        update_probe_on_result(
+                            item.tag,
+                            &item.article.job_id,
+                            server.id(),
+                            true,
+                            probe_tags,
+                            probe_tracker,
+                            policy,
+                        );
+                    }
                     let _ = outcome_tx
                         .send(FetchOutcome::Success {
                             tag: item.tag,
@@ -608,6 +800,17 @@ async fn handle_scheduler_msg(
                     item.article.mark_server_tried(server.id());
                     if !matches!(err, NntpError::ArticleNotFound(_)) {
                         item.article.mark_transient_failure();
+                    }
+                    if let Some(policy) = probe_policy {
+                        update_probe_on_result(
+                            item.tag,
+                            &item.article.job_id,
+                            server.id(),
+                            false,
+                            probe_tags,
+                            probe_tracker,
+                            policy,
+                        );
                     }
                     match penalty_for_error(&err) {
                         PenaltyAction::None => {}
