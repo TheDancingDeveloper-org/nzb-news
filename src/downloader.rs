@@ -748,20 +748,10 @@ async fn wrapper_worker(
             }
         }
 
-        // Run pipelined fetch.
-        let per_item_results =
-            fetch_batch_pipelined(&mut wrapper, &server, &batch, article_timeout).await;
-
-        // Hand results back to the scheduler.
-        for (item, result) in per_item_results {
-            let _ = scheduler_tx
-                .send(SchedulerMsg::FetchResult {
-                    item,
-                    server: server.clone(),
-                    result,
-                })
-                .await;
-        }
+        // Run pipelined fetch. Results are streamed to the scheduler per
+        // response so cascade-to-next-server can start on the first 430
+        // without waiting for the slower BODY responses later in the batch.
+        fetch_and_stream(&mut wrapper, &server, batch, article_timeout, &scheduler_tx).await;
         queue.note_completed(batch_len);
 
         // If the wrapper's connection is dead after the batch, break out
@@ -806,120 +796,143 @@ async fn wrapper_worker(
 /// Issue every item in `batch` pipelined on the wrapper's connection and
 /// collect per-item results. Wrapped with an overall timeout scaled to
 /// batch size.
-async fn fetch_batch_pipelined(
+/// Pipelined fetch with **per-response streaming**: each article outcome
+/// is forwarded to the scheduler the moment it lands, instead of the whole
+/// batch being buffered and flushed at batch-end.
+///
+/// Why this matters: on a mostly-missing NZB, the scheduler observes 430s
+/// and re-routes those items to the next server. If all 10 items in a
+/// batch are buffered until the slowest BODY (sometimes 8+ seconds) comes
+/// back, the cascade-latency for a missing article becomes N × batch_ms
+/// instead of N × single_response_ms. That's the difference between SAB's
+/// "fail in 2min" and our "fail in 6min" on the same NZB.
+///
+/// The cost of early-emit is paid on the scheduler side (one `send` per
+/// response instead of one per batch), which is cheap — it's a bounded
+/// mpsc. The payoff on failure-cascade scenarios is substantial.
+async fn fetch_and_stream(
     wrapper: &mut NewsWrapper,
     server: &Arc<Server>,
-    batch: &[WorkItem],
+    batch: Vec<WorkItem>,
     per_article_timeout: Duration,
-) -> Vec<(WorkItem, Result<Vec<u8>, NntpError>)> {
+    scheduler_tx: &mpsc::Sender<SchedulerMsg>,
+) {
     use nzb_nntp::pipeline::Pipeline;
+    use std::collections::HashMap;
 
+    let batch_len = batch.len();
+    let depth = server.config().pipelining.max(1);
     let batch_timeout = per_article_timeout
-        .checked_mul(batch.len() as u32)
+        .checked_mul(batch_len as u32)
         .unwrap_or(per_article_timeout);
 
-    let depth = server.config().pipelining.max(1);
+    // Build pipeline queue + tag → WorkItem map for routing responses back.
     let mut pipeline = Pipeline::new(depth);
-    for (idx, item) in batch.iter().enumerate() {
-        pipeline.submit(item.article.message_id.clone(), idx as u64);
+    let mut pending: HashMap<u64, WorkItem> = HashMap::with_capacity(batch_len);
+    for item in batch {
+        pipeline.submit(item.article.message_id.clone(), item.tag);
+        pending.insert(item.tag, item);
     }
 
-    // Per-batch timing. Emitted at debug so operators running at info
-    // aren't flooded with per-fetch noise; flip with `RUST_LOG=nzb_news=debug`
-    // (or finer-grained `nzb_news::downloader=debug`) when diagnosing
-    // throughput or cascade-latency issues.
     let batch_start = std::time::Instant::now();
     debug!(
         server = %server.id(),
         wrapper_id = wrapper.id,
-        batch_size = batch.len(),
+        batch_size = batch_len,
         pipeline_depth = depth,
         "batch_start"
     );
-    let outcome = tokio::time::timeout(batch_timeout, async {
-        let conn = wrapper
-            .conn_mut()
-            .ok_or_else(|| NntpError::Connection("Wrapper has no connection".into()))?;
-        pipeline.process_all(conn).await
+
+    // Streaming loop: flush as many sends as depth allows, then read one
+    // response, emit it to scheduler, loop. `pending.remove(&tag)` routes
+    // each response back to its originating WorkItem.
+    let result = tokio::time::timeout(batch_timeout, async {
+        loop {
+            let conn = wrapper
+                .conn_mut()
+                .ok_or_else(|| NntpError::Connection("Wrapper has no connection".into()))?;
+            pipeline.flush_sends(conn).await?;
+            if pipeline.is_empty() {
+                break;
+            }
+            let maybe_res = pipeline.receive_one(conn).await?;
+            let Some(res) = maybe_res else { break };
+            let tag = res.request.tag;
+            let Some(item) = pending.remove(&tag) else {
+                // Shouldn't happen — every submitted tag is in the map.
+                continue;
+            };
+            let result = match res.result {
+                Ok(resp) => {
+                    let bytes = resp.data.unwrap_or_default();
+                    wrapper.on_fetch_success(bytes.len() as u64);
+                    Ok(bytes)
+                }
+                Err(e) => Err(e),
+            };
+            let _ = scheduler_tx
+                .send(SchedulerMsg::FetchResult {
+                    item,
+                    server: server.clone(),
+                    result,
+                })
+                .await;
+        }
+        Ok::<(), NntpError>(())
     })
     .await;
+
     let batch_ms = batch_start.elapsed().as_millis() as u64;
     debug!(
         server = %server.id(),
         wrapper_id = wrapper.id,
-        batch_size = batch.len(),
+        batch_size = batch_len,
         batch_ms,
+        remaining = pending.len(),
         "batch_done"
     );
 
-    let per_item = match outcome {
-        Ok(Ok(results)) => results,
+    // On fatal error or timeout, emit the un-served remainder as errors.
+    // Successes up to the failure point already streamed above.
+    let fatal = match result {
+        Ok(Ok(())) => None,
         Ok(Err(e)) => {
             warn!(
                 server = %server.id(),
                 wrapper_id = wrapper.id,
-                batch_size = batch.len(),
+                remaining = pending.len(),
                 error = %e,
                 "batch pipeline aborted"
             );
             wrapper.hard_reset().await;
-            return batch
-                .iter()
-                .cloned()
-                .map(|it| (it, Err(clone_err(&e))))
-                .collect();
+            Some(e)
         }
         Err(_elapsed) => {
             warn!(
                 server = %server.id(),
                 wrapper_id = wrapper.id,
                 timeout_ms = batch_timeout.as_millis() as u64,
-                batch_size = batch.len(),
+                remaining = pending.len(),
                 "batch timeout — hard-reset"
             );
             wrapper.hard_reset().await;
-            return batch
-                .iter()
-                .cloned()
-                .map(|it| {
-                    (
-                        it,
-                        Err(NntpError::Timeout(format!(
-                            "batch timed out after {}s",
-                            batch_timeout.as_secs()
-                        ))),
-                    )
-                })
-                .collect();
+            Some(NntpError::Timeout(format!(
+                "batch timed out after {}s",
+                batch_timeout.as_secs()
+            )))
         }
     };
-
-    // Map pipeline results (by tag) back to items (by index).
-    use std::collections::HashMap;
-    let mut by_tag: HashMap<u64, Result<Vec<u8>, NntpError>> =
-        HashMap::with_capacity(per_item.len());
-    for r in per_item {
-        let res = match r.result {
-            Ok(resp) => {
-                let bytes = resp.data.unwrap_or_default();
-                wrapper.on_fetch_success(bytes.len() as u64);
-                Ok(bytes)
-            }
-            Err(e) => Err(e),
-        };
-        by_tag.insert(r.request.tag, res);
+    if let Some(e) = fatal {
+        for (_, item) in pending.drain() {
+            let _ = scheduler_tx
+                .send(SchedulerMsg::FetchResult {
+                    item,
+                    server: server.clone(),
+                    result: Err(clone_err(&e)),
+                })
+                .await;
+        }
     }
-
-    let mut out = Vec::with_capacity(batch.len());
-    for (idx, item) in batch.iter().enumerate() {
-        let res = by_tag.remove(&(idx as u64)).unwrap_or_else(|| {
-            Err(NntpError::Protocol(
-                "pipeline dropped response for tag".into(),
-            ))
-        });
-        out.push((item.clone(), res));
-    }
-    out
 }
 
 fn clone_err(err: &NntpError) -> NntpError {
