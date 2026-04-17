@@ -360,6 +360,10 @@ impl ProbeState {
 pub struct DownloaderHandle {
     work_tx: mpsc::Sender<WorkItem>,
     control_tx: mpsc::Sender<ControlMsg>,
+    /// Shared view of the server pool — same `Arc<Server>` instances the
+    /// scheduler uses, so `server_stats_snapshot` reads the same atomics
+    /// that per-fetch handling writes.
+    servers: Arc<Vec<Arc<crate::server::Server>>>,
     shutdown: Arc<Notify>,
     driver_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -405,6 +409,16 @@ impl DownloaderHandle {
 
     pub fn shutdown(&self) {
         self.shutdown.notify_waiters();
+    }
+
+    /// Snapshot of per-server lifetime attempt counters. Returns one entry
+    /// per configured server as `(server_id, stats)`. Cheap — just atomic
+    /// reads — safe to call inline on hot paths like abort logging.
+    pub fn server_stats_snapshot(&self) -> Vec<(String, crate::server::ServerStats)> {
+        self.servers
+            .iter()
+            .map(|s| (s.id().to_string(), s.stats()))
+            .collect()
     }
 
     pub async fn join(mut self) {
@@ -481,6 +495,11 @@ pub fn spawn_downloader(
     // own the only senders now, so the scheduler can detect "all workers
     // exited" via `scheduler_rx.recv() -> None` (once they all drop).
 
+    // Shared server handle — same Arc<Server>s fed into the scheduler, so
+    // the scheduler's fetch-result handling and `DownloaderHandle::server_stats_snapshot`
+    // observe the same atomic counters.
+    let servers_shared: Arc<Vec<Arc<Server>>> = Arc::new(servers.clone());
+
     let scheduler_shutdown = shutdown.clone();
     let task = tokio::spawn(scheduler_loop(
         servers,
@@ -498,6 +517,7 @@ pub fn spawn_downloader(
         DownloaderHandle {
             work_tx,
             control_tx,
+            servers: servers_shared,
             shutdown,
             driver_task: Some(task),
         },
@@ -952,6 +972,7 @@ async fn handle_scheduler_msg(
                     let article_bytes = bytes.len() as u64;
                     item.job.record_article_downloaded(article_bytes);
                     item.file.mark_article_completed();
+                    server.record_attempt_success();
                     if let Some(policy) = probe_policy {
                         update_probe_on_result(
                             item.tag,
@@ -974,8 +995,11 @@ async fn handle_scheduler_msg(
                 }
                 Err(err) => {
                     item.article.mark_server_tried(server.id());
-                    if !matches!(err, NntpError::ArticleNotFound(_)) {
+                    if matches!(err, NntpError::ArticleNotFound(_)) {
+                        server.record_attempt_not_found();
+                    } else {
                         item.article.mark_transient_failure();
+                        server.record_attempt_transient_failed();
                     }
                     if let Some(policy) = probe_policy {
                         update_probe_on_result(

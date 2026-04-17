@@ -88,6 +88,35 @@ pub struct Server {
     /// effectively has no way to process work, and [`Server::is_usable`]
     /// returns `false` so the dispatcher routes articles elsewhere.
     active_wrappers: AtomicU32,
+
+    // -------------------------------------------------------------------
+    // Per-server attempt stats — lifetime totals for this Server instance.
+    // Incremented by the scheduler on every fetch result. Exposed via
+    // [`Server::stats`] so callers can distinguish "article cascaded past
+    // this server" from "this server never saw the article" when
+    // diagnosing why a job aborted.
+    // -------------------------------------------------------------------
+    /// Total fetch attempts dispatched to this server (successes + failures).
+    articles_attempted: AtomicU64,
+    /// Successful fetches (data returned, passed to decode).
+    articles_succeeded: AtomicU64,
+    /// `ArticleNotFound` (NNTP 430) responses — the "server doesn't carry
+    /// this article" signal. Biggest contributor to dead-NZB diagnostics.
+    articles_not_found: AtomicU64,
+    /// Transient / retryable failures (timeout, 500, auth, connection drop).
+    /// Separate from `not_found` so operators can tell "server is missing
+    /// articles" from "server is flaky".
+    articles_transient_failed: AtomicU64,
+}
+
+/// Snapshot of the per-server attempt counters at a point in time. Returned
+/// by [`Server::stats`] for inclusion in abort / diagnostic logs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServerStats {
+    pub attempted: u64,
+    pub succeeded: u64,
+    pub not_found: u64,
+    pub transient_failed: u64,
 }
 
 impl Server {
@@ -108,7 +137,41 @@ impl Server {
             last_connect_ms: AtomicU64::new(0),
             connect_epoch: now_epoch,
             active_wrappers: AtomicU32::new(0),
+            articles_attempted: AtomicU64::new(0),
+            articles_succeeded: AtomicU64::new(0),
+            articles_not_found: AtomicU64::new(0),
+            articles_transient_failed: AtomicU64::new(0),
         }
+    }
+
+    /// Snapshot of lifetime attempt counters for this server.
+    pub fn stats(&self) -> ServerStats {
+        ServerStats {
+            attempted: self.articles_attempted.load(Ordering::Relaxed),
+            succeeded: self.articles_succeeded.load(Ordering::Relaxed),
+            not_found: self.articles_not_found.load(Ordering::Relaxed),
+            transient_failed: self.articles_transient_failed.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Record a successful fetch. Called from the scheduler after a
+    /// wrapper returns article bytes.
+    pub(crate) fn record_attempt_success(&self) {
+        self.articles_attempted.fetch_add(1, Ordering::Relaxed);
+        self.articles_succeeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an NNTP 430 (article-not-found) response.
+    pub(crate) fn record_attempt_not_found(&self) {
+        self.articles_attempted.fetch_add(1, Ordering::Relaxed);
+        self.articles_not_found.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record any other per-attempt failure (transient / retryable).
+    pub(crate) fn record_attempt_transient_failed(&self) {
+        self.articles_attempted.fetch_add(1, Ordering::Relaxed);
+        self.articles_transient_failed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Register one more live wrapper worker on this server. Called when

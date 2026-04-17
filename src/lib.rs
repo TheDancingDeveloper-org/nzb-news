@@ -46,3 +46,4 @@ pub use article::{Article, NzbFile, NzbObject};
 pub use downloader::{
     DownloaderConfig, DownloaderHandle, FetchOutcome, ServerProbePolicy, WorkItem, spawn_downloader,
 };
+pub use server::ServerStats;
