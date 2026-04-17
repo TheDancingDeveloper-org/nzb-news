@@ -574,7 +574,16 @@ async fn scheduler_loop(
     // Drain any remaining scheduler_rx messages so workers exiting after
     // the close signal can still emit their final results.
     while let Some(msg) = scheduler_rx.recv().await {
-        handle_scheduler_msg(msg, &servers, &mut Vec::new(), &outcome_tx, probe_policy.as_ref(), &mut probe_tracker, &mut probe_tags).await;
+        handle_scheduler_msg(
+            msg,
+            &servers,
+            &mut Vec::new(),
+            &outcome_tx,
+            probe_policy.as_ref(),
+            &mut probe_tracker,
+            &mut probe_tags,
+        )
+        .await;
     }
 
     // Wait for every wrapper worker to exit.
@@ -624,10 +633,7 @@ async fn dispatch_pending(
                 let mut is_probe = false;
                 if let Some(policy) = probe_policy {
                     if !pending[i].article.try_list().is_empty() {
-                        let key = (
-                            pending[i].article.job_id.clone(),
-                            target.id().to_string(),
-                        );
+                        let key = (pending[i].article.job_id.clone(), target.id().to_string());
                         let state = probe_tracker.entry(key).or_insert_with(ProbeState::new);
                         match state.status {
                             ProbeStatus::Rejected => {
