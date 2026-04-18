@@ -372,3 +372,106 @@ async fn gives_up_after_retries_across_servers_all_fail() {
     handle.join().await;
     assert_eq!(job.articles_failed(), 1);
 }
+
+#[tokio::test]
+async fn same_priority_servers_share_load_proportionally() {
+    // Three servers all at priority 0, mimicking aunews(4 conn) + asnews×2(10 conn).
+    // Submit 24 articles — all three servers should receive work, not just the
+    // first in config order. With proportional dispatch each server gets work
+    // proportional to its connection count (4/24, 10/24, 10/24).
+    let n_articles = 24usize;
+    let mut articles = HashMap::new();
+    for i in 0..n_articles {
+        articles.insert(format!("msg{i}"), vec![b'A'; 32]);
+    }
+
+    let s1 = MockNntpServer::start(MockConfig {
+        articles: articles.clone(),
+        ..Default::default()
+    })
+    .await;
+    let s2 = MockNntpServer::start(MockConfig {
+        articles: articles.clone(),
+        ..Default::default()
+    })
+    .await;
+    let s3 = MockNntpServer::start(MockConfig {
+        articles: articles.clone(),
+        ..Default::default()
+    })
+    .await;
+
+    let mut cfg1 = test_config(s1.port());
+    cfg1.id = "s1".into();
+    cfg1.priority = 0;
+    cfg1.connections = 4;
+    cfg1.ramp_up_delay_ms = 0;
+
+    let mut cfg2 = test_config(s2.port());
+    cfg2.id = "s2".into();
+    cfg2.priority = 0;
+    cfg2.connections = 10;
+    cfg2.ramp_up_delay_ms = 0;
+
+    let mut cfg3 = test_config(s3.port());
+    cfg3.id = "s3".into();
+    cfg3.priority = 0;
+    cfg3.connections = 10;
+    cfg3.ramp_up_delay_ms = 0;
+
+    let config = DownloaderConfig {
+        servers: vec![cfg1, cfg2, cfg3],
+        max_concurrent_fetches: 24,
+        article_timeout: Duration::from_secs(10),
+        work_channel_capacity: 64,
+        outcome_channel_capacity: 64,
+        probe_policy: None,
+    };
+    let (handle, outcomes) = spawn_downloader(config);
+
+    let file = Arc::new(NzbFile::new("f1", "j1", "demo.r00", n_articles as u32));
+    let job = Arc::new(NzbObject::new(
+        "j1",
+        "demo",
+        n_articles as u64,
+        32 * n_articles as u64,
+        vec![file.clone()],
+    ));
+
+    for i in 0..n_articles as u64 {
+        let art = Arc::new(Article::new(format!("msg{i}"), "f1", "j1", 32, i as u32, i));
+        handle
+            .submit(WorkItem {
+                tag: i,
+                article: art,
+                file: file.clone(),
+                job: job.clone(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let got = run_until_complete(&handle, outcomes, n_articles, Duration::from_secs(15)).await;
+
+    let mut per_server: HashMap<String, usize> = HashMap::new();
+    for outcome in &got {
+        if let FetchOutcome::Success { server_id, .. } = outcome {
+            *per_server.entry(server_id.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let successes: usize = per_server.values().sum();
+    assert_eq!(successes, n_articles, "all articles should succeed");
+
+    // All three servers must have participated — none should be empty.
+    for server_id in ["s1", "s2", "s3"] {
+        let count = per_server.get(server_id).copied().unwrap_or(0);
+        assert!(
+            count > 0,
+            "server {server_id} received no articles; distribution: {per_server:?}"
+        );
+    }
+
+    handle.shutdown();
+    handle.join().await;
+}

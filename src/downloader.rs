@@ -804,6 +804,37 @@ async fn dispatch_pending(
                     }
                 };
 
+                // Load-balance fresh articles across same-priority servers.
+                //
+                // select_server returns the first eligible server in priority
+                // order. For fresh articles (no prior attempts) this is always
+                // the same server, causing one server to monopolize dispatch
+                // when multiple servers share a priority tier. Instead, pick the
+                // server in the tier with the most available capacity (lowest
+                // current-load / connections ratio).
+                let idx = if pending[i].article.try_list().is_empty() {
+                    let tier_priority = servers[idx].priority();
+                    (0..servers.len())
+                        .filter(|&j| {
+                            servers[j].priority() == tier_priority
+                                && servers[j].is_active()
+                                && !servers[j].is_penalised()
+                                && server_queues[j].depth() + per_server[j].len()
+                                    < per_server_cap[j]
+                        })
+                        .min_by_key(|&j| {
+                            // Scale load by 1000/connections to get a per-connection
+                            // saturation score (lower = more available). Integer only.
+                            let load = server_queues[j].depth() + per_server[j].len();
+                            let conns = servers[j].connections().max(1) as usize;
+                            load * 1000 / conns
+                        })
+                        .unwrap_or(idx)
+                } else {
+                    idx
+                };
+                let target = &servers[idx];
+
                 // Probe gate: for cascade articles (already tried ≥ 1 server) sample
                 // a small batch before committing the full backlog to the backup server.
                 let mut is_probe = false;
@@ -846,12 +877,6 @@ async fn dispatch_pending(
                     continue;
                 }
                 let item = pending.swap_remove(i);
-                // Update the ramp-up timestamp so subsequent articles in
-                // this same dispatch pass see the server as gated and fall
-                // through to the next server. Without this, persistent
-                // workers (which never call take_idle_wrapper) always route
-                // everything to the first eligible server.
-                target.note_dispatch();
                 item.article.set_fetcher_priority(target.priority());
                 if is_probe {
                     probe_tags.insert(item.tag);
