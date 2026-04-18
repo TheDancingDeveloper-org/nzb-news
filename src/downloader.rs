@@ -823,11 +823,12 @@ async fn dispatch_pending(
                                     < per_server_cap[j]
                         })
                         .min_by_key(|&j| {
-                            // Scale load by 1000/connections to get a per-connection
-                            // saturation score (lower = more available). Integer only.
+                            // (load+1)/conns: +1 ensures score is non-zero when idle,
+                            // so higher-capacity servers get lower scores and are
+                            // preferred for fresh articles even before any work starts.
                             let load = server_queues[j].depth() + per_server[j].len();
                             let conns = servers[j].connections().max(1) as usize;
-                            load * 1000 / conns
+                            (load + 1) * 1000 / conns
                         })
                         .unwrap_or(idx)
                 } else {
