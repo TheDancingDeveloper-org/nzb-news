@@ -356,6 +356,17 @@ impl Server {
         }
     }
 
+    /// Record that an article was just dispatched to this server.
+    ///
+    /// Updates the ramp-up timestamp so `rampup_wait` gates subsequent
+    /// articles correctly in the persistent-worker model. In that model
+    /// `take_idle_wrapper` is never called (workers hold wrappers for
+    /// their lifetime), so this is the only place the timestamp is set.
+    pub fn note_dispatch(&self) {
+        let now_ms = (self.connect_epoch.elapsed().as_millis() as u64).max(1);
+        self.last_connect_ms.store(now_ms, Ordering::Relaxed);
+    }
+
     /// Return a wrapper to the busy set. Typically called right after
     /// a wrapper has been dispatched on an article.
     pub fn return_wrapper_busy(&self, w: NewsWrapper) {

@@ -846,6 +846,12 @@ async fn dispatch_pending(
                     continue;
                 }
                 let item = pending.swap_remove(i);
+                // Update the ramp-up timestamp so subsequent articles in
+                // this same dispatch pass see the server as gated and fall
+                // through to the next server. Without this, persistent
+                // workers (which never call take_idle_wrapper) always route
+                // everything to the first eligible server.
+                target.note_dispatch();
                 item.article.set_fetcher_priority(target.priority());
                 if is_probe {
                     probe_tags.insert(item.tag);
