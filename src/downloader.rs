@@ -285,6 +285,10 @@ enum SchedulerMsg {
         server: Arc<Server>,
         error: String,
     },
+    /// Every wrapper worker for `server_id` has retired. The scheduler's
+    /// per-server supervisor should schedule a respawn after a cooldown
+    /// so the server can come back online without operator intervention.
+    AllWrappersExited { server_id: String },
 }
 
 /// Out-of-band commands from the caller (distinct from worker-result
@@ -467,33 +471,27 @@ pub fn spawn_downloader(
     // lifetime; the Server's idle/busy sets aren't used by this path
     // (they remain the abstraction for ad-hoc callers, but persistent
     // workers hold the wrapper the whole time).
+    let article_timeout = config.article_timeout;
     let mut worker_handles = Vec::new();
     for (s, q) in servers.iter().zip(server_queues.iter()) {
         let conns = s.config().connections.max(1);
-        for worker_id in 1..=conns {
-            let wrapper = NewsWrapper::new(s.id().to_string(), worker_id as u32);
-            let server = s.clone();
-            let queue = q.clone();
-            let scheduler_tx = scheduler_tx.clone();
-            let shutdown = shutdown.clone();
-            let article_timeout = config.article_timeout;
-            // Register before spawn so a race where the worker exits
-            // immediately still decrements from a non-zero baseline.
-            server.register_wrapper();
-            worker_handles.push(tokio::spawn(wrapper_worker(
-                wrapper,
-                server,
-                queue,
-                scheduler_tx,
-                shutdown,
-                article_timeout,
-            )));
-        }
+        worker_handles.extend(spawn_server_wrappers(
+            s.clone(),
+            q.clone(),
+            scheduler_tx.clone(),
+            shutdown.clone(),
+            article_timeout,
+            conns,
+            1,
+        ));
     }
 
-    // Drop the scheduler's own cloneable sender — the wrapper workers
-    // own the only senders now, so the scheduler can detect "all workers
-    // exited" via `scheduler_rx.recv() -> None` (once they all drop).
+    // The scheduler keeps its own `scheduler_tx` clone so the channel
+    // stays open even after every wrapper for every server has retired.
+    // That's essential for the supervisor: once a server goes offline,
+    // we need to be able to respawn wrappers (which will take new senders
+    // from this clone) rather than tearing the whole scheduler down.
+    let scheduler_self_tx = scheduler_tx.clone();
 
     // Shared server handle — same Arc<Server>s fed into the scheduler, so
     // the scheduler's fetch-result handling and `DownloaderHandle::server_stats_snapshot`
@@ -506,10 +504,12 @@ pub fn spawn_downloader(
         server_queues,
         work_rx,
         scheduler_rx,
+        scheduler_self_tx,
         control_rx,
         outcome_tx,
         scheduler_shutdown,
         worker_handles,
+        article_timeout,
         probe_policy,
     ));
 
@@ -526,6 +526,114 @@ pub fn spawn_downloader(
 }
 
 // ---------------------------------------------------------------------------
+// Server supervisor — respawns wrapper workers after all of them retire,
+// with exponential backoff. Replaces the historical behaviour of latching
+// the server offline forever (queue.close + nowhere to dispatch to).
+// ---------------------------------------------------------------------------
+
+/// Cooldown applied the first time a server's wrappers all exit. Short
+/// enough to recover quickly from transient upstream hiccups (proxy
+/// restart, brief DNS blip), long enough to avoid hot-looping if the
+/// provider is legitimately down.
+const SUPERVISOR_INITIAL_COOLDOWN: Duration = Duration::from_secs(30);
+/// Upper bound on the exponential backoff. A provider that's been
+/// rejecting connections for 10 minutes is probably going to reject them
+/// for longer — but we keep probing so recovery is automatic.
+const SUPERVISOR_MAX_COOLDOWN: Duration = Duration::from_secs(600);
+/// If a server stays healthy (any successful fetch) for this long after a
+/// respawn, the consecutive-offline counter resets so a future outage
+/// gets the short initial cooldown again.
+const SUPERVISOR_HEALTHY_RESET: Duration = Duration::from_secs(300);
+
+struct ServerSupervisor {
+    server: Arc<Server>,
+    queue: Arc<ServerQueue>,
+    /// None = server online (or no respawn yet scheduled). Some = wake up
+    /// at this instant and spawn a fresh wrapper pool.
+    next_respawn_at: Option<tokio::time::Instant>,
+    /// Number of times the wrapper pool has fully exited in a row. Used
+    /// to compute the backoff: 30s * 2^(n-1), capped at 600s.
+    consecutive_offline: u32,
+    /// Last time this server produced a successful fetch result. Used to
+    /// reset `consecutive_offline` after an extended healthy window.
+    last_healthy_at: tokio::time::Instant,
+}
+
+impl ServerSupervisor {
+    fn new(server: Arc<Server>, queue: Arc<ServerQueue>) -> Self {
+        Self {
+            server,
+            queue,
+            next_respawn_at: None,
+            consecutive_offline: 0,
+            last_healthy_at: tokio::time::Instant::now(),
+        }
+    }
+
+    fn schedule_respawn(&mut self) {
+        self.consecutive_offline = self.consecutive_offline.saturating_add(1);
+        let steps = self.consecutive_offline.saturating_sub(1).min(6);
+        let cooldown = SUPERVISOR_INITIAL_COOLDOWN
+            .saturating_mul(1u32 << steps)
+            .min(SUPERVISOR_MAX_COOLDOWN);
+        self.next_respawn_at = Some(tokio::time::Instant::now() + cooldown);
+        warn!(
+            server = %self.server.id(),
+            consecutive_offline = self.consecutive_offline,
+            cooldown_secs = cooldown.as_secs(),
+            "supervisor: server offline, scheduling respawn"
+        );
+    }
+
+    fn note_success(&mut self) {
+        let now = tokio::time::Instant::now();
+        if now.duration_since(self.last_healthy_at) >= SUPERVISOR_HEALTHY_RESET
+            && self.consecutive_offline > 0
+        {
+            debug!(
+                server = %self.server.id(),
+                "supervisor: server healthy, resetting backoff"
+            );
+            self.consecutive_offline = 0;
+        }
+        self.last_healthy_at = now;
+    }
+}
+
+/// Spawn `count` wrapper_worker tasks for `server`, starting worker IDs
+/// at `id_offset`. Each task calls `server.register_wrapper()` before
+/// entering the loop (counter pre-incremented here to avoid a race where
+/// the task exits before `register_wrapper` runs).
+fn spawn_server_wrappers(
+    server: Arc<Server>,
+    queue: Arc<ServerQueue>,
+    scheduler_tx: mpsc::Sender<SchedulerMsg>,
+    shutdown: Arc<Notify>,
+    article_timeout: Duration,
+    count: u16,
+    id_offset: u32,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handles = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let wrapper = NewsWrapper::new(server.id().to_string(), id_offset + i as u32);
+        let s = server.clone();
+        let q = queue.clone();
+        let tx = scheduler_tx.clone();
+        let shut = shutdown.clone();
+        server.register_wrapper();
+        handles.push(tokio::spawn(wrapper_worker(
+            wrapper,
+            s,
+            q,
+            tx,
+            shut,
+            article_timeout,
+        )));
+    }
+    handles
+}
+
+// ---------------------------------------------------------------------------
 // Scheduler loop — routes pending articles to server queues and consumes
 // wrapper-worker results.
 // ---------------------------------------------------------------------------
@@ -535,10 +643,12 @@ async fn scheduler_loop(
     server_queues: Vec<Arc<ServerQueue>>,
     mut work_rx: mpsc::Receiver<WorkItem>,
     mut scheduler_rx: mpsc::Receiver<SchedulerMsg>,
+    scheduler_tx: mpsc::Sender<SchedulerMsg>,
     mut control_rx: mpsc::Receiver<ControlMsg>,
     outcome_tx: mpsc::Sender<FetchOutcome>,
     shutdown: Arc<Notify>,
     worker_handles: Vec<tokio::task::JoinHandle<()>>,
+    article_timeout: Duration,
     probe_policy: Option<ServerProbePolicy>,
 ) {
     info!(
@@ -558,6 +668,26 @@ async fn scheduler_loop(
     // in `pending` but aren't routed to any server queue. Articles already
     // handed off (in `server_queues[idx]` or mid-fetch) complete normally.
     let mut paused_jobs: HashSet<String> = HashSet::new();
+
+    // Per-server supervisor state. One entry per server, parallel to
+    // `servers` / `server_queues`. Looked up by server id when an
+    // `AllWrappersExited` msg arrives or a successful fetch comes back.
+    let mut supervisors: Vec<ServerSupervisor> = servers
+        .iter()
+        .zip(server_queues.iter())
+        .map(|(s, q)| ServerSupervisor::new(s.clone(), q.clone()))
+        .collect();
+
+    // JoinSet that owns every wrapper_worker handle — initial pool plus
+    // anything the supervisor respawns later. At shutdown we wait for
+    // them all. Using JoinSet instead of Vec so respawned handles live
+    // in the same place without a second drain pass.
+    let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    for h in worker_handles {
+        workers.spawn(async move {
+            let _ = h.await;
+        });
+    }
 
     // Rough soft cap on per-server queue depth: (connections × pipelining × 2).
     // Prevents one server's queue from absorbing all pending work when
@@ -624,7 +754,7 @@ async fn scheduler_loop(
             maybe_msg = scheduler_rx.recv() => {
                 match maybe_msg {
                     Some(msg) => {
-                        handle_scheduler_msg(msg, &servers, &mut pending, &outcome_tx, probe_policy.as_ref(), &mut probe_tracker, &mut probe_tags).await;
+                        route_scheduler_msg(msg, &servers, &mut supervisors, &mut pending, &outcome_tx, probe_policy.as_ref(), &mut probe_tracker, &mut probe_tags).await;
                         // Drain burst: wrappers now emit one FetchResult
                         // per article response (streaming), so a batch of
                         // N in-flight articles produces N scheduler msgs in
@@ -633,11 +763,15 @@ async fn scheduler_loop(
                         // Consuming the whole burst here means one O(N) pass
                         // serves all of them.
                         while let Ok(extra) = scheduler_rx.try_recv() {
-                            handle_scheduler_msg(extra, &servers, &mut pending, &outcome_tx, probe_policy.as_ref(), &mut probe_tracker, &mut probe_tags).await;
+                            route_scheduler_msg(extra, &servers, &mut supervisors, &mut pending, &outcome_tx, probe_policy.as_ref(), &mut probe_tracker, &mut probe_tags).await;
                         }
                     }
                     None => {
-                        // All wrapper workers have exited.
+                        // The scheduler holds its own `scheduler_tx` clone,
+                        // so this branch is unreachable in practice. Tolerate
+                        // it by breaking — if somehow every sender dropped,
+                        // there's nothing left to do.
+                        debug!("scheduler_rx returned None (unexpected)");
                         break;
                     }
                 }
@@ -721,6 +855,74 @@ async fn scheduler_loop(
                 next_dispatch_retry = None;
                 continue;
             }
+
+            _ = async {
+                // Sleep until the earliest scheduled respawn — or park
+                // forever if no server is offline. `biased` above means
+                // the other branches are preferred; this one only wins
+                // when the scheduler is idle and a cooldown is due.
+                let now = tokio::time::Instant::now();
+                let soonest = supervisors
+                    .iter()
+                    .filter_map(|s| s.next_respawn_at)
+                    .min();
+                match soonest {
+                    Some(t) => {
+                        let rem = t.saturating_duration_since(now);
+                        tokio::time::sleep(rem.max(Duration::from_millis(1))).await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // Respawn wrappers for any server whose cooldown has elapsed.
+                let now = tokio::time::Instant::now();
+                for sup in supervisors.iter_mut() {
+                    let due = matches!(sup.next_respawn_at, Some(t) if t <= now);
+                    if !due {
+                        continue;
+                    }
+                    sup.next_respawn_at = None;
+                    let conns = sup.server.config().connections.max(1);
+                    // `active_wrappers` should be zero here, but if it's
+                    // not (e.g. a slow retirement hasn't completed yet)
+                    // spawning more would over-subscribe the server. Skip
+                    // and let the next AllWrappersExited trigger retry.
+                    if sup.server.active_wrappers() > 0 {
+                        debug!(
+                            server = %sup.server.id(),
+                            active = sup.server.active_wrappers(),
+                            "supervisor: respawn deferred, wrappers still active"
+                        );
+                        continue;
+                    }
+                    info!(
+                        server = %sup.server.id(),
+                        connections = conns,
+                        consecutive_offline = sup.consecutive_offline,
+                        "supervisor: respawning wrapper pool"
+                    );
+                    let handles = spawn_server_wrappers(
+                        sup.server.clone(),
+                        sup.queue.clone(),
+                        scheduler_tx.clone(),
+                        shutdown.clone(),
+                        article_timeout,
+                        conns,
+                        // Offset worker_ids by the retry count so logs
+                        // distinguish respawned wrappers from the originals.
+                        1 + sup.consecutive_offline.saturating_mul(1000),
+                    );
+                    for h in handles {
+                        workers.spawn(async move {
+                            let _ = h.await;
+                        });
+                    }
+                    // Kick dispatch — there may be pending items that
+                    // couldn't find a target while this server was offline.
+                    next_dispatch_retry = None;
+                }
+                continue;
+            }
         }
     }
 
@@ -736,12 +938,19 @@ async fn scheduler_loop(
             .await;
     }
 
+    // Drop our own scheduler_tx clone so `scheduler_rx.recv()` will
+    // return None once the last wrapper worker also drops its sender.
+    // Without this, the drain loop below would hang waiting for a
+    // sender that stays alive in our local.
+    drop(scheduler_tx);
+
     // Drain any remaining scheduler_rx messages so workers exiting after
     // the close signal can still emit their final results.
     while let Some(msg) = scheduler_rx.recv().await {
-        handle_scheduler_msg(
+        route_scheduler_msg(
             msg,
             &servers,
+            &mut supervisors,
             &mut Vec::new(),
             &outcome_tx,
             probe_policy.as_ref(),
@@ -751,10 +960,9 @@ async fn scheduler_loop(
         .await;
     }
 
-    // Wait for every wrapper worker to exit.
-    for h in worker_handles {
-        let _ = h.await;
-    }
+    // Wait for every wrapper worker to exit — initial pool and any that
+    // the supervisor respawned during the run.
+    while workers.join_next().await.is_some() {}
 
     info!("downloader scheduler exiting");
 }
@@ -984,6 +1192,73 @@ fn update_probe_on_result(
 // ---------------------------------------------------------------------------
 // SchedulerMsg dispatch.
 // ---------------------------------------------------------------------------
+
+/// Entry point called by `scheduler_loop`. Handles supervisor-level
+/// side effects (respawn scheduling, backoff reset on healthy fetches),
+/// then forwards FetchResult / ReturnUnattempted to `handle_scheduler_msg`
+/// for the main dispatch logic. `AllWrappersExited` is consumed here.
+#[allow(clippy::too_many_arguments)]
+async fn route_scheduler_msg(
+    msg: SchedulerMsg,
+    servers: &[Arc<Server>],
+    supervisors: &mut [ServerSupervisor],
+    pending: &mut Vec<WorkItem>,
+    outcome_tx: &mpsc::Sender<FetchOutcome>,
+    probe_policy: Option<&ServerProbePolicy>,
+    probe_tracker: &mut HashMap<(String, String), ProbeState>,
+    probe_tags: &mut HashSet<WorkTag>,
+) {
+    match msg {
+        SchedulerMsg::AllWrappersExited { server_id } => {
+            if let Some(sup) = supervisors
+                .iter_mut()
+                .find(|s| s.server.id() == server_id.as_str())
+            {
+                sup.schedule_respawn();
+            }
+        }
+        SchedulerMsg::FetchResult {
+            item,
+            server,
+            result,
+        } => {
+            if result.is_ok()
+                && let Some(sup) = supervisors
+                    .iter_mut()
+                    .find(|s| s.server.id() == server.id())
+            {
+                sup.note_success();
+            }
+            handle_scheduler_msg(
+                SchedulerMsg::FetchResult {
+                    item,
+                    server,
+                    result,
+                },
+                servers,
+                pending,
+                outcome_tx,
+                probe_policy,
+                probe_tracker,
+                probe_tags,
+            )
+            .await;
+        }
+        other @ SchedulerMsg::ReturnUnattempted { .. } => {
+            handle_scheduler_msg(
+                other,
+                servers,
+                pending,
+                outcome_tx,
+                probe_policy,
+                probe_tracker,
+                probe_tags,
+            )
+            .await;
+        }
+    }
+}
+
 async fn handle_scheduler_msg(
     msg: SchedulerMsg,
     servers: &[Arc<Server>],
@@ -994,6 +1269,9 @@ async fn handle_scheduler_msg(
     probe_tags: &mut HashSet<WorkTag>,
 ) {
     match msg {
+        // AllWrappersExited is consumed upstream in `route_scheduler_msg`
+        // — if we ever see it here, ignore gracefully.
+        SchedulerMsg::AllWrappersExited { .. } => {}
         SchedulerMsg::FetchResult {
             item,
             server,
@@ -1215,8 +1493,11 @@ async fn wrapper_worker(
     if remaining == 0 {
         // Last wrapper for this server has retired. Drain whatever's
         // still in the server's queue back to the scheduler so those
-        // items can be dispatched elsewhere, then close the queue so
-        // the dispatcher stops routing here.
+        // items can be dispatched elsewhere. We deliberately DO NOT
+        // close the queue — the scheduler's per-server supervisor will
+        // spawn fresh wrappers after a cooldown, and they'll consume
+        // from this same queue. Closing here was the historical bug
+        // that latched servers offline for the process lifetime.
         let stranded = queue.drain_all().await;
         if !stranded.is_empty() {
             let _ = scheduler_tx
@@ -1227,11 +1508,15 @@ async fn wrapper_worker(
                 })
                 .await;
         }
-        queue.close();
         warn!(
             server = %server.id(),
-            "all wrapper workers exited — server offline, items rerouted"
+            "all wrapper workers exited — supervisor will schedule respawn"
         );
+        let _ = scheduler_tx
+            .send(SchedulerMsg::AllWrappersExited {
+                server_id: server.id().to_string(),
+            })
+            .await;
     }
 }
 
@@ -1415,5 +1700,80 @@ mod tests {
     fn downloader_config_has_min_concurrency() {
         let c = DownloaderConfig::from_servers(vec![]);
         assert!(c.max_concurrent_fetches >= 4);
+    }
+
+    // ---- ServerSupervisor state machine --------------------------------
+
+    fn make_supervisor() -> ServerSupervisor {
+        let cfg = ServerConfig::new("sup-test", "h");
+        let server = Arc::new(Server::new(cfg));
+        let queue = ServerQueue::new(server.clone());
+        ServerSupervisor::new(server, queue)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_schedules_initial_cooldown() {
+        let mut sup = make_supervisor();
+        assert!(sup.next_respawn_at.is_none());
+        sup.schedule_respawn();
+        assert_eq!(sup.consecutive_offline, 1);
+        let rem = sup
+            .next_respawn_at
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert_eq!(rem, SUPERVISOR_INITIAL_COOLDOWN);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_backs_off_exponentially_up_to_cap() {
+        let mut sup = make_supervisor();
+        // First retirement: 30s
+        sup.schedule_respawn();
+        let d1 = sup
+            .next_respawn_at
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now());
+        // Second retirement: 60s
+        sup.schedule_respawn();
+        let d2 = sup
+            .next_respawn_at
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(d2 > d1, "backoff should grow ({d1:?} -> {d2:?})");
+        // Many retirements in a row hit the cap, not unbounded growth.
+        for _ in 0..20 {
+            sup.schedule_respawn();
+        }
+        let d_capped = sup
+            .next_respawn_at
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            d_capped <= SUPERVISOR_MAX_COOLDOWN,
+            "cooldown must not exceed cap, got {d_capped:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_resets_after_healthy_window() {
+        let mut sup = make_supervisor();
+        // Simulate 3 consecutive offlines so backoff is well above the floor.
+        sup.schedule_respawn();
+        sup.schedule_respawn();
+        sup.schedule_respawn();
+        assert_eq!(sup.consecutive_offline, 3);
+
+        // A success inside the "still-flapping" window must NOT reset counter.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        sup.note_success();
+        assert_eq!(
+            sup.consecutive_offline, 3,
+            "reset should only fire after the full healthy window"
+        );
+
+        // After a long healthy window, the next success resets the counter.
+        tokio::time::advance(SUPERVISOR_HEALTHY_RESET + Duration::from_secs(1)).await;
+        sup.note_success();
+        assert_eq!(sup.consecutive_offline, 0);
     }
 }

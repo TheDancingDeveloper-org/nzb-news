@@ -475,3 +475,94 @@ async fn same_priority_servers_share_load_proportionally() {
     handle.shutdown();
     handle.join().await;
 }
+
+/// Regression: a server whose wrappers all self-retire (terminal auth/503
+/// errors) must not wedge the whole downloader. Historically the offending
+/// server's queue was `close()`d forever and `select_server` stopped
+/// considering it — but dispatch of *other* servers continued. This test
+/// verifies that after the broken primary's wrappers have all exited, a
+/// healthy backup still delivers the article and the downloader shuts
+/// down cleanly without a hang.
+#[tokio::test]
+async fn downloader_survives_total_wrapper_retirement_on_one_server() {
+    // Primary always returns 502 on banner → NntpError::ServiceUnavailable
+    // (terminal class). Every wrapper self-retires after 3 consecutive
+    // connect failures, eventually all of them.
+    let primary = MockNntpServer::start(MockConfig {
+        service_unavailable: true,
+        ..Default::default()
+    })
+    .await;
+
+    let mut backup_articles = HashMap::new();
+    backup_articles.insert("msg-sup-1".to_string(), b"payload-1".to_vec());
+    backup_articles.insert("msg-sup-2".to_string(), b"payload-2".to_vec());
+    let backup = MockNntpServer::start(MockConfig {
+        articles: backup_articles,
+        ..Default::default()
+    })
+    .await;
+
+    let mut primary_cfg = test_config(primary.port());
+    primary_cfg.id = "broken-primary".into();
+    primary_cfg.priority = 1;
+    primary_cfg.connections = 2;
+    primary_cfg.ramp_up_delay_ms = 0;
+
+    let mut backup_cfg = test_config(backup.port());
+    backup_cfg.id = "healthy-backup".into();
+    backup_cfg.priority = 5;
+    backup_cfg.connections = 2;
+    backup_cfg.ramp_up_delay_ms = 0;
+
+    let config = DownloaderConfig {
+        servers: vec![primary_cfg, backup_cfg],
+        max_concurrent_fetches: 4,
+        article_timeout: Duration::from_secs(10),
+        work_channel_capacity: 64,
+        outcome_channel_capacity: 64,
+        probe_policy: None,
+    };
+    let (handle, outcomes) = spawn_downloader(config);
+
+    let file = Arc::new(NzbFile::new("fsup", "jsup", "demo.r00", 2));
+    let job = Arc::new(NzbObject::new("jsup", "demo", 2, 18, vec![file.clone()]));
+
+    for (tag, msg) in [(101u64, "msg-sup-1"), (102u64, "msg-sup-2")] {
+        let art = Arc::new(Article::new(msg, "fsup", "jsup", 9, 0, tag));
+        handle
+            .submit(WorkItem {
+                tag,
+                article: art,
+                file: file.clone(),
+                job: job.clone(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Both articles should reach the backup. Give the dispatcher plenty
+    // of time — each primary connect attempt consumes the 3-strike
+    // budget per wrapper before it retires.
+    let got = run_until_complete(&handle, outcomes, 2, Duration::from_secs(30)).await;
+    assert_eq!(got.len(), 2);
+    for outcome in &got {
+        match outcome {
+            FetchOutcome::Success { server_id, .. } => {
+                assert_eq!(
+                    server_id, "healthy-backup",
+                    "article should land on the healthy backup"
+                );
+            }
+            other => panic!("expected success via backup, got {other:?}"),
+        }
+    }
+
+    // Clean shutdown must return promptly — the scheduler should not be
+    // stuck on a closed queue or an orphaned worker handle. Historically
+    // a bug here could make `join` wait indefinitely.
+    handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), handle.join())
+        .await
+        .expect("downloader did not shut down within 5s");
+}
