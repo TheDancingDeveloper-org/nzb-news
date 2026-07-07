@@ -779,20 +779,20 @@ async fn scheduler_loop(
 
             maybe_ctrl = control_rx.recv() => {
                 match maybe_ctrl {
-                    Some(ControlMsg::PauseJob { job_id }) => {
-                        if paused_jobs.insert(job_id.clone()) {
-                            debug!(job_id = %job_id, "scheduler: pause");
-                        }
+                    Some(ControlMsg::PauseJob { job_id })
+                        if paused_jobs.insert(job_id.clone()) =>
+                    {
+                        debug!(job_id = %job_id, "scheduler: pause");
                     }
-                    Some(ControlMsg::ResumeJob { job_id }) => {
-                        if paused_jobs.remove(&job_id) {
-                            debug!(job_id = %job_id, "scheduler: resume");
-                            // Articles for this job sat idle in `pending`;
-                            // clear any retry backoff so they route on the
-                            // next iteration.
-                            next_dispatch_retry = None;
-                        }
+                    Some(ControlMsg::PauseJob { .. }) => {}
+                    Some(ControlMsg::ResumeJob { job_id }) if paused_jobs.remove(&job_id) => {
+                        debug!(job_id = %job_id, "scheduler: resume");
+                        // Articles for this job sat idle in `pending`;
+                        // clear any retry backoff so they route on the
+                        // next iteration.
+                        next_dispatch_retry = None;
                     }
+                    Some(ControlMsg::ResumeJob { .. }) => {}
                     Some(ControlMsg::PurgeJob { job_id }) => {
                         // Remove pending articles for the job and emit
                         // Cancelled outcomes so upstream accounting closes
