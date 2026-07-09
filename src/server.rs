@@ -517,7 +517,7 @@ impl Server {
             let mut busy = self.busy_wrappers.lock().expect("busy mutex poisoned");
             busy_taken.append(&mut *busy);
         }
-        for mut w in idle_taken.into_iter().chain(busy_taken.into_iter()) {
+        for mut w in idle_taken.into_iter().chain(busy_taken) {
             w.hard_reset().await;
         }
         self.bad_cons.store(0, Ordering::Relaxed);

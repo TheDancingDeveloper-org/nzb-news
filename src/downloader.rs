@@ -22,9 +22,16 @@
 //! every connection simultaneously.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+/// Shared snapshot of paused job ids. The scheduler owns the write side
+/// (updated on PauseJob/ResumeJob/PurgeJob) and every wrapper_worker holds
+/// a reader so in-flight pipelined batches can be aborted mid-stream when
+/// their job becomes paused. Read only between pipeline responses — one
+/// extra in-flight response per batch may still be recorded.
+pub(crate) type PausedJobs = Arc<RwLock<HashSet<String>>>;
 
 use nzb_nntp::config::ServerConfig;
 use nzb_nntp::error::NntpError;
@@ -357,6 +364,32 @@ impl ProbeState {
     }
 }
 
+fn rollback_probe_dispatch(
+    job_id: &str,
+    server_id: &str,
+    tag: WorkTag,
+    probe_tags: &mut HashSet<WorkTag>,
+    probe_tracker: &mut HashMap<(String, String), ProbeState>,
+) -> bool {
+    if !probe_tags.remove(&tag) {
+        return false;
+    }
+
+    let key = (job_id.to_string(), server_id.to_string());
+    let remove_state = if let Some(state) = probe_tracker.get_mut(&key) {
+        state.probes_sent = state.probes_sent.saturating_sub(1);
+        state.probes_sent == 0 && state.probes_returned == 0 && state.probes_hit == 0
+    } else {
+        false
+    };
+
+    if remove_state {
+        probe_tracker.remove(&key);
+    }
+
+    true
+}
+
 // ---------------------------------------------------------------------------
 // DownloaderHandle
 // ---------------------------------------------------------------------------
@@ -467,6 +500,10 @@ pub fn spawn_downloader(
     // are infrequent (API-driven) and should never back up.
     let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(64);
 
+    // Shared paused-job set. Scheduler writes; wrappers read between
+    // pipeline responses to abort in-flight batches when their job pauses.
+    let paused_shared: PausedJobs = Arc::new(RwLock::new(HashSet::new()));
+
     // Spawn wrapper worker tasks. Each owns one NewsWrapper for its
     // lifetime; the Server's idle/busy sets aren't used by this path
     // (they remain the abstraction for ad-hoc callers, but persistent
@@ -483,6 +520,7 @@ pub fn spawn_downloader(
             article_timeout,
             conns,
             1,
+            paused_shared.clone(),
         ));
     }
 
@@ -511,6 +549,7 @@ pub fn spawn_downloader(
         worker_handles,
         article_timeout,
         probe_policy,
+        paused_shared,
     ));
 
     (
@@ -604,6 +643,7 @@ impl ServerSupervisor {
 /// at `id_offset`. Each task calls `server.register_wrapper()` before
 /// entering the loop (counter pre-incremented here to avoid a race where
 /// the task exits before `register_wrapper` runs).
+#[allow(clippy::too_many_arguments)]
 fn spawn_server_wrappers(
     server: Arc<Server>,
     queue: Arc<ServerQueue>,
@@ -612,6 +652,7 @@ fn spawn_server_wrappers(
     article_timeout: Duration,
     count: u16,
     id_offset: u32,
+    paused_jobs: PausedJobs,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::with_capacity(count as usize);
     for i in 0..count {
@@ -620,6 +661,7 @@ fn spawn_server_wrappers(
         let q = queue.clone();
         let tx = scheduler_tx.clone();
         let shut = shutdown.clone();
+        let pj = paused_jobs.clone();
         server.register_wrapper();
         handles.push(tokio::spawn(wrapper_worker(
             wrapper,
@@ -628,6 +670,7 @@ fn spawn_server_wrappers(
             tx,
             shut,
             article_timeout,
+            pj,
         )));
     }
     handles
@@ -650,6 +693,7 @@ async fn scheduler_loop(
     worker_handles: Vec<tokio::task::JoinHandle<()>>,
     article_timeout: Duration,
     probe_policy: Option<ServerProbePolicy>,
+    paused_jobs_shared: PausedJobs,
 ) {
     info!(
         servers = servers.len(),
@@ -729,6 +773,116 @@ async fn scheduler_loop(
                 break;
             }
 
+            maybe_ctrl = control_rx.recv() => {
+                match maybe_ctrl {
+                    Some(ControlMsg::PauseJob { job_id })
+                        if paused_jobs.insert(job_id.clone()) =>
+                    {
+                        paused_jobs_shared.write().unwrap().insert(job_id.clone());
+                        // Drain items for this job from every server queue
+                        // back to `pending` — the pause gate in
+                        // dispatch_pending will keep them there until
+                        // resume. Without this, wrapper workers keep
+                        // pulling batches until the queues empty (up to
+                        // ~per_server_cap items per server).
+                        let mut drained_total = 0usize;
+                        for q in &server_queues {
+                            let items = q.drain_job(&job_id).await;
+                            drained_total += items.len();
+                            pending.extend(items);
+                        }
+                        debug!(
+                            job_id = %job_id,
+                            drained_from_server_queues = drained_total,
+                            "scheduler: pause"
+                        );
+                    }
+                    Some(ControlMsg::ResumeJob { job_id }) if paused_jobs.remove(&job_id) => {
+                        paused_jobs_shared.write().unwrap().remove(&job_id);
+                        debug!(job_id = %job_id, "scheduler: resume");
+                        next_dispatch_retry = None;
+                    }
+                    Some(ControlMsg::PauseJob { .. } | ControlMsg::ResumeJob { .. }) => {}
+                    Some(ControlMsg::PurgeJob { job_id }) => {
+                        // Remove pending articles for the job and emit
+                        // Cancelled outcomes so upstream accounting closes
+                        // them out. Also clear any probe state / pause flag
+                        // tied to this job, and rip items out of each
+                        // server queue so wrapper workers don't keep
+                        // fetching ghost articles that would consume slots
+                        // healthy jobs could use.
+                        let before = pending.len();
+                        let mut kept: Vec<WorkItem> = Vec::with_capacity(pending.len());
+                        for item in pending.drain(..) {
+                            if item.article.job_id == job_id {
+                                let _ = outcome_tx
+                                    .send(FetchOutcome::Cancelled { tag: item.tag })
+                                    .await;
+                            } else {
+                                kept.push(item);
+                            }
+                        }
+                        pending = kept;
+                        let mut q_drained = 0usize;
+                        for q in &server_queues {
+                            let items = q.drain_job(&job_id).await;
+                            q_drained += items.len();
+                            for it in items {
+                                let _ = outcome_tx
+                                    .send(FetchOutcome::Cancelled { tag: it.tag })
+                                    .await;
+                            }
+                        }
+                        probe_tracker.retain(|(j, _), _| j != &job_id);
+                        probe_tags.retain(|_tag| {
+                            // Probe tags don't carry job_id directly; leave
+                            // them — they'll be resolved to Cancelled/ignored
+                            true
+                        });
+                        paused_jobs.remove(&job_id);
+                        paused_jobs_shared.write().unwrap().remove(&job_id);
+                        debug!(
+                            job_id = %job_id,
+                            pending_removed = before - pending.len(),
+                            q_drained,
+                            "scheduler: purge"
+                        );
+                    }
+                    None => {}
+                }
+                // Drain any burst of control messages.
+                while let Ok(extra) = control_rx.try_recv() {
+                    match extra {
+                        ControlMsg::PauseJob { job_id } => {
+                            if paused_jobs.insert(job_id.clone()) {
+                                paused_jobs_shared.write().unwrap().insert(job_id.clone());
+                                for q in &server_queues {
+                                    let items = q.drain_job(&job_id).await;
+                                    pending.extend(items);
+                                }
+                            }
+                        }
+                        ControlMsg::ResumeJob { job_id } => {
+                            if paused_jobs.remove(&job_id) {
+                                paused_jobs_shared.write().unwrap().remove(&job_id);
+                                next_dispatch_retry = None;
+                            }
+                        }
+                        ControlMsg::PurgeJob { job_id } => {
+                            pending.retain(|it| it.article.job_id != job_id);
+                            for q in &server_queues {
+                                let items = q.drain_job(&job_id).await;
+                                for it in items {
+                                    let _ = outcome_tx.send(FetchOutcome::Cancelled { tag: it.tag }).await;
+                                }
+                            }
+                            paused_jobs.remove(&job_id);
+                            paused_jobs_shared.write().unwrap().remove(&job_id);
+                        }
+                    }
+                }
+                continue;
+            }
             maybe_item = work_rx.recv() => {
                 match maybe_item {
                     Some(item) => {
@@ -773,74 +927,6 @@ async fn scheduler_loop(
                         // there's nothing left to do.
                         debug!("scheduler_rx returned None (unexpected)");
                         break;
-                    }
-                }
-            }
-
-            maybe_ctrl = control_rx.recv() => {
-                match maybe_ctrl {
-                    Some(ControlMsg::PauseJob { job_id }) => {
-                        if paused_jobs.insert(job_id.clone()) {
-                            debug!(job_id = %job_id, "scheduler: pause");
-                        }
-                    }
-                    Some(ControlMsg::ResumeJob { job_id }) => {
-                        if paused_jobs.remove(&job_id) {
-                            debug!(job_id = %job_id, "scheduler: resume");
-                            // Articles for this job sat idle in `pending`;
-                            // clear any retry backoff so they route on the
-                            // next iteration.
-                            next_dispatch_retry = None;
-                        }
-                    }
-                    Some(ControlMsg::PurgeJob { job_id }) => {
-                        // Remove pending articles for the job and emit
-                        // Cancelled outcomes so upstream accounting closes
-                        // them out. Also clear any probe state / pause flag
-                        // tied to this job, and rip items out of each
-                        // server queue so wrapper workers don't keep
-                        // fetching ghost articles that would consume slots
-                        // healthy jobs could use.
-                        let before = pending.len();
-                        let mut kept: Vec<WorkItem> = Vec::with_capacity(pending.len());
-                        for item in pending.drain(..) {
-                            if item.article.job_id == job_id {
-                                let _ = outcome_tx
-                                    .send(FetchOutcome::Cancelled { tag: item.tag })
-                                    .await;
-                            } else {
-                                kept.push(item);
-                            }
-                        }
-                        pending = kept;
-                        let mut q_drained = 0usize;
-                        for q in &server_queues {
-                            let items = q.drain_job(&job_id).await;
-                            q_drained += items.len();
-                            for it in items {
-                                let _ = outcome_tx
-                                    .send(FetchOutcome::Cancelled { tag: it.tag })
-                                    .await;
-                            }
-                        }
-                        probe_tracker.retain(|(j, _), _| j != &job_id);
-                        probe_tags.retain(|_tag| {
-                            // Probe tags don't carry job_id directly; leave
-                            // them — they'll be resolved to Cancelled/ignored
-                            // on outcome by the dispatcher.
-                            true
-                        });
-                        paused_jobs.remove(&job_id);
-                        debug!(
-                            job_id = %job_id,
-                            purged_pending = before - pending.len(),
-                            purged_queues = q_drained,
-                            "scheduler: purge"
-                        );
-                    }
-                    None => {
-                        // Handle dropped — shouldn't happen while the
-                        // downloader is running, but tolerate it.
                     }
                 }
             }
@@ -911,6 +997,7 @@ async fn scheduler_loop(
                         // Offset worker_ids by the retry count so logs
                         // distinguish respawned wrappers from the originals.
                         1 + sup.consecutive_offline.saturating_mul(1000),
+                        paused_jobs_shared.clone(),
                     );
                     for h in handles {
                         workers.spawn(async move {
@@ -1363,7 +1450,17 @@ async fn handle_scheduler_msg(
             // reference to them.
             server.register_failure(crate::server::DEFAULT_PENALTY);
             let requeued = items.len();
+            let mut rolled_back_probes = 0usize;
             for item in items {
+                if rollback_probe_dispatch(
+                    &item.article.job_id,
+                    server.id(),
+                    item.tag,
+                    probe_tags,
+                    probe_tracker,
+                ) {
+                    rolled_back_probes += 1;
+                }
                 item.article.mark_server_tried(server.id());
                 item.article.mark_transient_failure();
                 pending.push(item);
@@ -1371,6 +1468,7 @@ async fn handle_scheduler_msg(
             warn!(
                 server = %server.id(),
                 items = requeued,
+                rolled_back_probes,
                 error = %error,
                 "wrapper batch aborted; items re-queued for dispatch on other servers"
             );
@@ -1397,6 +1495,7 @@ async fn wrapper_worker(
     scheduler_tx: mpsc::Sender<SchedulerMsg>,
     shutdown: Arc<Notify>,
     article_timeout: Duration,
+    paused_jobs: PausedJobs,
 ) {
     let pipeline_depth = server.config().pipelining.max(1) as usize;
     let mut consecutive_connect_failures: u32 = 0;
@@ -1471,7 +1570,15 @@ async fn wrapper_worker(
         // Run pipelined fetch. Results are streamed to the scheduler per
         // response so cascade-to-next-server can start on the first 430
         // without waiting for the slower BODY responses later in the batch.
-        fetch_and_stream(&mut wrapper, &server, batch, article_timeout, &scheduler_tx).await;
+        fetch_and_stream(
+            &mut wrapper,
+            &server,
+            batch,
+            article_timeout,
+            &scheduler_tx,
+            &paused_jobs,
+        )
+        .await;
         queue.note_completed(batch_len);
 
         // If the wrapper's connection is dead after the batch, break out
@@ -1543,6 +1650,7 @@ async fn fetch_and_stream(
     batch: Vec<WorkItem>,
     per_article_timeout: Duration,
     scheduler_tx: &mpsc::Sender<SchedulerMsg>,
+    paused_jobs: &PausedJobs,
 ) {
     use nzb_nntp::pipeline::Pipeline;
     use std::collections::HashMap;
@@ -1570,11 +1678,31 @@ async fn fetch_and_stream(
         "batch_start"
     );
 
+    // Pause detection: between pipeline responses, check whether any
+    // in-flight pending item belongs to a paused job. If so, short-circuit
+    // — the connection will be hard-reset below, abandoning the remaining
+    // pipelined BODY responses on the wire, and scheduler is notified so
+    // it can re-queue the remainder on resume.
+    let check_paused = |pending: &HashMap<u64, WorkItem>| -> bool {
+        let set = paused_jobs.read().unwrap();
+        if set.is_empty() {
+            return false;
+        }
+        pending
+            .values()
+            .any(|it| set.contains(it.article.job_id.as_str()))
+    };
+    let mut paused_abort = false;
+
     // Streaming loop: flush as many sends as depth allows, then read one
     // response, emit it to scheduler, loop. `pending.remove(&tag)` routes
     // each response back to its originating WorkItem.
     let result = tokio::time::timeout(batch_timeout, async {
         loop {
+            if check_paused(&pending) {
+                paused_abort = true;
+                return Ok::<(), NntpError>(());
+            }
             let conn = wrapper
                 .conn_mut()
                 .ok_or_else(|| NntpError::Connection("Wrapper has no connection".into()))?;
@@ -1618,6 +1746,31 @@ async fn fetch_and_stream(
         remaining = pending.len(),
         "batch_done"
     );
+
+    // Pause-abort: hard-reset connection to abandon any pipelined BODY
+    // responses still on the wire, and bounce the remainder back to the
+    // scheduler as unattempted so they land in `pending` (where the pause
+    // gate will hold them until resume).
+    if paused_abort {
+        warn!(
+            server = %server.id(),
+            wrapper_id = wrapper.id,
+            remaining = pending.len(),
+            "batch aborted — job paused"
+        );
+        wrapper.hard_reset().await;
+        let remaining: Vec<WorkItem> = pending.drain().map(|(_, it)| it).collect();
+        if !remaining.is_empty() {
+            let _ = scheduler_tx
+                .send(SchedulerMsg::ReturnUnattempted {
+                    items: remaining,
+                    server: server.clone(),
+                    error: "paused".into(),
+                })
+                .await;
+        }
+        return;
+    }
 
     // On fatal error or timeout, emit the un-served remainder as errors.
     // Successes up to the failure point already streamed above.
@@ -1775,5 +1928,29 @@ mod tests {
         tokio::time::advance(SUPERVISOR_HEALTHY_RESET + Duration::from_secs(1)).await;
         sup.note_success();
         assert_eq!(sup.consecutive_offline, 0);
+    }
+
+    #[test]
+    fn rollback_probe_dispatch_rewinds_probe_state() {
+        let mut probe_tags = HashSet::from([42]);
+        let mut probe_tracker = HashMap::from([(
+            ("job-1".to_string(), "server-a".to_string()),
+            ProbeState {
+                probes_sent: 1,
+                probes_returned: 0,
+                probes_hit: 0,
+                status: ProbeStatus::Probing,
+            },
+        )]);
+
+        assert!(rollback_probe_dispatch(
+            "job-1",
+            "server-a",
+            42,
+            &mut probe_tags,
+            &mut probe_tracker,
+        ));
+        assert!(!probe_tags.contains(&42));
+        assert!(!probe_tracker.contains_key(&("job-1".to_string(), "server-a".to_string())));
     }
 }
